@@ -1,5 +1,6 @@
 import argparse
 import asyncio
+from operator import is_
 import time
 from dataclasses import dataclass
 
@@ -47,8 +48,9 @@ async def send_one_request(
         )
         end = time.perf_counter()
         latency_ms = (end-start)*1000
+        is_success  = response.status_code == 200
         return RequestResult(
-            success=True,
+            success=is_success,
             latency_ms=latency_ms,
             status_code=response.status_code,
             error=None if response.status_code == 200 else response.text,
@@ -95,6 +97,7 @@ def print_summary(results: list[RequestResult], total_time: float, concurrency: 
     failed_results = [r for r in results if not r.success]
     latencies = [r.latency_ms for r in success_results]
     qps = total / total_time if total_time > 0 else 0.0
+    success_qps = len(success_results) / total_time if total_time > 0 else 0.0
     avg_latency = sum(latencies) / len(latencies) if latencies else 0.0
     print(f"Total requests: {total}")
     print(f"Concurrency: {concurrency}")
@@ -102,6 +105,7 @@ def print_summary(results: list[RequestResult], total_time: float, concurrency: 
     print(f"Failed: {len(failed_results)}")
     print(f"Total time: {total_time:.2f}s")
     print(f"QPS: {qps:.2f}")
+    print(f"Success QPS: {success_qps:.2f}")
     print(f"Avg latency: {avg_latency:.2f} ms")
     print(f"P50 latency: {percentile(latencies, 50):.2f} ms")
     print(f"P95 latency: {percentile(latencies, 95):.2f} ms")
