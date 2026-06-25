@@ -73,7 +73,7 @@ class ContinuousBatchingEngine:
 
     async def submit(self,req : GenerateRequest) -> GenerateResult:
         if not self.running:
-            raise ValueError("engine is not running")
+            raise RuntimeError("engine is not running")
         if req.request_id in self.pending:
             raise ValueError(f"request_id {req.request_id} is already pending")
         

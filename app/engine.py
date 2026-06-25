@@ -12,6 +12,7 @@ class GenerateResult:
     text : str           #推理返回的生成文本
     latency_ms : float   #推理耗时 - 单位：毫秒
 
+# Static Batch !!!
 class InferenceEngine:
     """异步推理引擎
 
