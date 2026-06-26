@@ -22,9 +22,18 @@ class InferenceEngine:
       - pending: request_id -> Future,用于把结果还给 submit
       - running / _worker_task: 控制后台事件循环的生命周期
     """
-    def __init__(self,max_batch_size : int = 4):
+    def __init__(self,scheduler_type : str = "fifo",max_batch_size : int = 4,max_batch_tokens : int = 512):
         self.request_queue = RequestQueue()
-        self.scheduler = FIFOScheduler(self.request_queue,max_batch_size)
+
+        # 选择 scheduler 类型 · fifo 或 token_bucket
+        # fifo: 先进先出，每个 batch 都是按请求到达顺序处理的
+        # token_bucket: 每个 batch 都是按请求 max_tokens 限制处理的
+        if scheduler_type == "fifo":
+            self.scheduler = FIFOScheduler(self.request_queue,max_batch_size)
+        elif scheduler_type == "token_bucket":
+            self.scheduler = TokenBucketScheduler(self.request_queue,max_batch_tokens)
+        else:
+            raise ValueError(f"invalid scheduler_type: {scheduler_type}")
 
         self.pending : dict[str,asyncio.Future[GenerateResult]] = {}
 
@@ -32,12 +41,19 @@ class InferenceEngine:
         self._worker_task : asyncio.Task | None = None
 
     async def start(self):
+        """
+            启动引擎： 启动一个  run_loop  这个常驻的函数进程
+        """
         if self.running:
             return
         self.running = True
         self._worker_task = asyncio.create_task(self.run_loop())
 
     async def stop(self) -> None:
+        """
+            停止引擎： 取消后台事件循环，等待所有请求完成
+            并将所有 pending 中的 Future 设置为异常状态
+        """
         self.running = False
         for request_id, future in list(self.pending.items()):
             if not future.done():
@@ -52,8 +68,13 @@ class InferenceEngine:
             self._worker_task = None
 
     async def submit(self,req : GenerateRequest) -> GenerateResult:
+        """
+            提交请求： 将请求加入 request_queue 并返回一个 Future
+            Future 用于接收推理结果
+            如果引擎未运行，抛出 ValueError
+        """
         if not self.running:
-            raise ValueError("engine is not running")
+            raise RuntimeError("engine is not running")
         
         # 检查 request_id 是否已存在 pending 中 : 确保 req_id 唯一
         if req.request_id in self.pending:
@@ -67,6 +88,9 @@ class InferenceEngine:
         return await future
     
     async def run_loop(self):
+        """
+            引擎的核心事件循环： 不断从 request_queue 取请求，调度 batch,运行 batch,返回结果
+        """
         while self.running:
             if self.request_queue.empty():
                 await asyncio.sleep(0.001)
@@ -85,15 +109,22 @@ class InferenceEngine:
             await self._fake_prefill(batch)
             await self._fake_decode(batch)
         except Exception as e:
-            print(f"Error in _run_batch: {e}")
-            raise e
+            """
+                处理异常： 将所有请求的 Future 设置为异常状态
+            """
+            for req in batch:
+                future = self.pending.pop(req.request_id,None)
+                if future is not None and not future.done():
+                    future.set_exception(e)
+            return
 
         finish_time = time.time()
 
         for req in batch:
             future  = self.pending.pop(req.request_id,None)
-            if future == None:
+            if future is None or future.done():
                 continue
+
             latency = (finish_time - req.arrival_time) * 1000
             result = GenerateResult(
                 request_id = req.request_id,

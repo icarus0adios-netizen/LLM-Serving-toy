@@ -9,9 +9,11 @@ class RequestQueue:
         return len(self._queue)
 
     def push(self,req : GenerateRequest) -> None:
+        """ Push 一个请求到队列 """
         self._queue.append(req)
 
     def pop_batch(self,batch_size : int) -> list[GenerateRequest]:
+        """ Pop 一个批次的请求 """
         if batch_size <= 0:
             raise ValueError("batch_size must be greater than 0")
         batch_size = min(batch_size, len(self._queue))

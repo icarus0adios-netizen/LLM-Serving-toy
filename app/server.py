@@ -30,7 +30,7 @@ class GenerateInput(BaseModel):
     prompt : str = Field(...,min_length=1)
     max_tokens : int = Field(default=64,gt=1,le=1024)
 
-class GenerateOuput(BaseModel):
+class GenerateOutput(BaseModel):
     request_id : str
     text : str
     latency_ms : float
@@ -42,8 +42,9 @@ async def health() -> dict:
         "engine": engine.running,
     }
 
-@app.post("/generate",response_model=GenerateOuput)
-async def generate(inp : GenerateInput) -> GenerateOuput:
+
+@app.post("/generate",response_model=GenerateOutput)
+async def generate(inp : GenerateInput) -> GenerateOutput:
     req_id = str(uuid.uuid4())
 
     req = GenerateRequest(
@@ -57,7 +58,7 @@ async def generate(inp : GenerateInput) -> GenerateOuput:
 
     metrics.record_latency(result.latency_ms)
 
-    return GenerateOuput(
+    return GenerateOutput(
         request_id=req_id,
         text=result.text,
         latency_ms=result.latency_ms,

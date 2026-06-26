@@ -3,7 +3,7 @@ from app.request import GenerateRequest
 
 class FIFOScheduler:
     def __init__(self,queue: RequestQueue,max_batch_size:int) -> None:
-        if max_batch_size < 0 :
+        if max_batch_size <= 0 :
             raise ValueError("max_batch_size must be greater than 0")
         self.queue = queue
         self.max_batch_size = max_batch_size
@@ -14,7 +14,7 @@ class FIFOScheduler:
 
 class TokenBucketScheduler:
     def __init__(self,queue : RequestQueue , max_batch_tokens : int) -> None:
-        if max_batch_tokens < 0 :
+        if max_batch_tokens <= 0 :
             raise ValueError("max_batch_tokens must be greater than 0")
         self.queue = queue
         self.max_batch_tokens  = max_batch_tokens
