@@ -28,3 +28,20 @@
 本基准测试是一个面向学习的单进程 asyncio 基准测试。它从客户端测量端到端的 HTTP 延迟。它不测量真实的 TTFT（首 Token 生成时间）、TPOT（每个输出 Token 的时间）、GPU 利用率、KV 缓存使用情况或 Token 级别的流式延迟。
 
 当前引擎使用虚拟的 prefill 和 decode 延迟，因此结果仅应用于理解请求排队、批处理以及延迟/吞吐量之间的权衡。
+
+## 引擎对比实验
+
+### 请求混合比例
+
+- short（短请求）: 70%, prompt_len=10, max_tokens=4
+- medium（中等请求）: 20%, prompt_len=30, max_tokens=32
+- long（长请求）: 10%, prompt_len=100, max_tokens=128
+
+### 关键发现
+
+1. Static FIFO 实现简单，但存在队首阻塞（head-of-line blocking）问题。
+2. TokenBucket 对 max_batch_tokens 参数敏感。
+3. 在此模拟环境中，max_batch_tokens=512 的 TokenBucket 表现优于 FIFO。
+4. Continuous Batching 显著降低短请求的延迟。
+5. Continuous Batching 在当前准入策略下会恶化长请求的延迟。
+6. 该模拟器未模拟真实的 GPU/KV 缓存并行度。

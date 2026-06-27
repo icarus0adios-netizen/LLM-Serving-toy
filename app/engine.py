@@ -36,6 +36,8 @@ class InferenceEngine:
             raise ValueError(f"invalid scheduler_type: {scheduler_type}")
 
         self.pending : dict[str,asyncio.Future[GenerateResult]] = {}
+        self.total_batches =0
+        self.batch_sizes : list[int] = []
 
         self.running = False
         self._worker_task : asyncio.Task | None = None
@@ -86,6 +88,23 @@ class InferenceEngine:
         self.request_queue.push(req)
 
         return await future
+
+    def stat(self) -> dict:
+        """
+            获取引擎的统计信息
+            包含 scheduler 类型,总 batch 数,平均 batch 大小,当前 pending 数,队列大小
+        """
+        avg_batch_sizes = 0.0
+        if self.batch_sizes:
+            avg_batch_sizes = sum(self.batch_sizes) / len(self.batch_sizes)
+        
+        return {
+            "scheduler": self.scheduler.type,
+            "total_batches": self.total_batches,
+            "avg_batch_size": avg_batch_sizes,
+            "pending": len(self.pending),
+            "queue_size": len(self.request_queue),
+        }
     
     async def run_loop(self):
         """
@@ -119,6 +138,10 @@ class InferenceEngine:
             return
 
         finish_time = time.time()
+
+        # 统计 batch 信息 + 每个 batch 大小
+        self.total_batches +=1
+        self.batch_sizes.append(len(batch))
 
         for req in batch:
             future  = self.pending.pop(req.request_id,None)
