@@ -76,7 +76,7 @@ class InferenceEngine:
             如果引擎未运行，抛出 ValueError
         """
         if not self.running:
-            raise RuntimeError("engine is not running")
+            raise ValueError("engine is not running")
         
         # 检查 request_id 是否已存在 pending 中 : 确保 req_id 唯一
         if req.request_id in self.pending:
