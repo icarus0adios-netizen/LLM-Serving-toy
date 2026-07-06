@@ -58,6 +58,36 @@ class BlockAllocator:
             
         return block_ids
 
+    def allocate_more(self,request_id : str,num_blocks : int) -> list[int]:
+        """ 为请求动态扩容 block 
+            使用情景 : decoding 阶段，会根据输出 token增长 动态扩容 block
+        """
+        if not request_id:
+            raise ValueError("request_id must be non-empty")
+        if num_blocks <= 0:
+            raise ValueError("num_blocks must be greater than 0")
+        if request_id not in self.request_to_blocks:
+            raise ValueError(f"request_id {request_id} not allocated")
+
+        free_blocks = [block for block in self.blocks if block.is_free]
+
+        if len(free_blocks) < num_blocks:
+            raise OutOfKVCacheError(
+                f"not enough free blocks: required={num_blocks}, available={len(free_blocks)}"
+            )
+
+        selected_blocks = free_blocks[:num_blocks]
+        new_block_ids = []
+
+        for block in selected_blocks:
+            block.is_free = False
+            block.request_id = request_id
+            new_block_ids.append(block.block_id)
+        
+        self.request_to_blocks[request_id].extend(new_block_ids)
+
+        return new_block_ids
+
     def allocate_for_tokens(self,request_id : str,num_tokens : int) -> list[int]:
         """ 为请求分配 token 数对应的 block """
         if not request_id:
@@ -69,6 +99,16 @@ class BlockAllocator:
         
         block_size = self.num_blocks_for_tokens(num_tokens)
         return self.allocate(request_id,block_size)
+
+    def allocated_block_counts(self,request_id : str) -> int:
+        """ 获取请求已分配的 block 数 """
+        if request_id not in self.request_to_blocks:
+            raise KeyError(f"request_id {request_id} not allocated")
+        return len(self.request_to_blocks.get(request_id,[]))
+
+    def allocated_token_counts(self,request_id : str) -> int:
+        """ 获取请求已分配的 token 数 """
+        return self.allocated_block_counts(request_id)*self.block_size_tokens
 
     def free(self,block_ids : list[int]) -> None:
         """ 按照 block_id 列表 释放 block """

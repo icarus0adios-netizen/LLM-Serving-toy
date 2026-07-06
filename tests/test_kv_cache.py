@@ -109,3 +109,68 @@ def test_stats():
         "free_blocks": 2,
         "num_requests": 1,
     }
+
+
+def test_allocate_more():
+    allocator = BlockAllocator(total_blocks=8, block_size_tokens=16)
+
+    allocator.allocate("req-1", 2)
+    block_ids = allocator.allocate_more("req-1", 3)
+
+    assert block_ids == [2, 3, 4]
+    assert allocator.used_block_count() == 5
+    assert allocator.free_block_count() == 3
+    assert allocator.request_to_blocks["req-1"] == [0, 1, 2, 3, 4]
+
+
+def test_allocate_more_not_allocated():
+    allocator = BlockAllocator(total_blocks=4, block_size_tokens=16)
+
+    with pytest.raises(ValueError):
+        allocator.allocate_more("unknown", 1)
+
+
+def test_allocate_more_not_enough_blocks():
+    allocator = BlockAllocator(total_blocks=4, block_size_tokens=16)
+
+    allocator.allocate("req-1", 2)
+
+    with pytest.raises(OutOfKVCacheError):
+        allocator.allocate_more("req-1", 3)
+
+
+def test_allocate_more_invalid_args():
+    allocator = BlockAllocator(total_blocks=4, block_size_tokens=16)
+    allocator.allocate("req-1", 1)
+
+    with pytest.raises(ValueError):
+        allocator.allocate_more("", 1)
+
+    with pytest.raises(ValueError):
+        allocator.allocate_more("req-1", 0)
+
+
+def test_allocated_block_counts():
+    allocator = BlockAllocator(total_blocks=4, block_size_tokens=16)
+
+    allocator.allocate("req-1", 3)
+
+    assert allocator.allocated_block_counts("req-1") == 3
+
+
+def test_allocated_token_counts():
+    allocator = BlockAllocator(total_blocks=4, block_size_tokens=16)
+
+    allocator.allocate("req-1", 3)
+
+    assert allocator.allocated_token_counts("req-1") == 3 * 16
+
+
+def test_allocated_counts_unknown_request():
+    allocator = BlockAllocator(total_blocks=4, block_size_tokens=16)
+
+    with pytest.raises(KeyError):
+        allocator.allocated_block_counts("unknown")
+
+    with pytest.raises(KeyError):
+        allocator.allocated_token_counts("unknown")
