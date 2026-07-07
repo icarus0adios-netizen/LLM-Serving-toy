@@ -1,5 +1,8 @@
+from typing import Optional
+
 from app.request import GenerateRequest
 from app.kv_cache import BlockAllocator,OutOfKVCacheError
+from app.request_state import RequestState
 import time
 import asyncio
 
@@ -12,6 +15,10 @@ class RunningRequest:
     prefilled : bool = False    # 该请求是否 完成 prefill 阶段
 
     kv_block_ids : list[int]  = field(default_factory=list) # 记录请求申请的 kv cache 的 block id
+
+    state : RequestState = RequestState.WAITING    # 当前的请求状态
+    preemption_count : int = 0                     # 该请求被抢占过的次数
+    recompute_tokens : int = 0                    # 恢复时需要重新计算的上下文 token 数。
 
 
 @dataclass
@@ -31,6 +38,7 @@ class ContinuousBatchingEngine:
         block_size_tokens : int = 16,
         decode_step_time : float = 0.002,
         prefill_time_per_token : float = 0.001,
+        max_preemptions_per_request : int = 3,
     ) -> None:
         """Initialize the continuous batching engine.
 
@@ -42,7 +50,7 @@ class ContinuousBatchingEngine:
             decode_step_time: Simulated time per decode step (seconds).
             prefill_time_per_token: Simulated time per prefill token (seconds).
         """
-        self.waiting_queue : asyncio.Queue[GenerateRequest]  = asyncio.Queue()
+        self.waiting_queue : asyncio.Queue[RunningRequest]  = asyncio.Queue()
         self.running_requests : list[RunningRequest] = []
         self.pending  : dict[str,asyncio.Future[GenerateResult]] = {}
 
@@ -60,9 +68,14 @@ class ContinuousBatchingEngine:
         self.total_completed_requests : int =0  # 已完成的请求数量
         self.total_kv_waits : int =0            # 因为暂时没有足够 KV block 而等待的次数
         self.total_rejected_requests : int =0   # 请求的总容量超过整个 allocator，永远不可能运行，被直接拒绝的数量。
-        self.total_kv_growth_events : int =0
-        self.total_kv_blocks_grown : int  =0
+        self.total_kv_growth_events : int =0    # 发生动态增长 KV block 事件的次数
+        self.total_kv_blocks_grown : int  =0    # 通过动态增长的 KV block 数量
         self.total_decode_kv_failures : int =0  # 因为没有足够 KV block 而失败的 decoding 次数
+        self.total_preemption_count : int =0    # 总的被抢占的请求数量
+        self.total_recompute_tokens : int =0    # 总的恢复时需要重新计算的上下文 token 数
+        self.total_recomputations : int = 0    # 总的恢复计算次数
+
+        self.max_preemptions_per_request: int = max_preemptions_per_request   # 一个请求 最多被抢占的次数 ： 防止一个请求被抢占次数过多，始终无法通过
     
     def stats(self) -> dict:
         """Return a snapshot of current engine statistics."""
@@ -80,6 +93,7 @@ class ContinuousBatchingEngine:
             "total_kv_growth_events" : self.total_kv_growth_events,
             "total_kv_blocks_grown" : self.total_kv_blocks_grown,
             "total_decode_kv_failures" : self.total_decode_kv_failures,
+            "total_preemption_count" : self.total_preemption_count,
             "kv_cache" : self.kv_allocator.stats(),
         }
 
@@ -133,7 +147,12 @@ class ContinuousBatchingEngine:
         future : asyncio.Future[GenerateResult]= loop.create_future()
         self.pending[req.request_id] = future
 
-        await self.waiting_queue.put(req)
+        await self.waiting_queue.put(
+            RunningRequest(
+                req=req,
+                state=RequestState.WAITING,
+            )
+        )
         return await future
 
     async def run_loop(self) -> None:
@@ -178,8 +197,8 @@ class ContinuousBatchingEngine:
             len(self.running_requests) < self.max_running_requests
             and not self.waiting_queue.empty()
         ):
-            req = await self.waiting_queue.get()
-            req_cost = GenerateRequest.request_cost(req)
+            item = await self.waiting_queue.get()
+            req_cost = GenerateRequest.request_cost(item.req)
             current_tokens = self.current_running_tokens()
             
             # 第一层：逻辑 token budget 限制
@@ -192,15 +211,15 @@ class ContinuousBatchingEngine:
                     我们仍然要允许它进入,否则会 starvation
                 """
                 # NOTE: putting the request back may change strict FIFO order.
-                await self.waiting_queue.put(req)
+                await self.waiting_queue.put(item)
                 break
 
             # 第二层： 永远无法运行！
-            maximum_blocks = self._maximum_kv_blocks(req)
+            maximum_blocks = self._maximum_kv_blocks(item.req)
 
             if maximum_blocks > self.kv_allocator.total_blocks:
                 self._reject_request(
-                    req,
+                    item.req,
                     RuntimeError(
                         "request requires more KV blocks than the "
                         f"entire cache: required={maximum_blocks}, "
@@ -212,16 +231,17 @@ class ContinuousBatchingEngine:
             
             # 第三层:当前暂时没有足够 block
 
-            required_blocks = self._prompt_kv_blocks(req)   # 只为 prompt（也就是prefill）阶段分配 block ,后续的decoding 再动态扩容
+            required_blocks =self._initial_kv_blocks(item)   # 分两种情况：1. 首次加入队列，只分配 prompt block 
+                                                             #  2. 如果是发生“preemption”后的请求 ，则需要分配当前 context tokens 对应的 block
 
             try:
                 block_ids = self.kv_allocator.allocate(
-                    request_id=req.request_id,
+                    request_id=item.req.request_id,
                     num_blocks=required_blocks,
                 )
             except OutOfKVCacheError:
                 self.total_kv_waits +=1 
-                await self.waiting_queue.put(req)
+                await self.waiting_queue.put(item)
                 break
 
             # 前面三层通过后 构建 Running request 请求，加入队列
@@ -229,8 +249,9 @@ class ContinuousBatchingEngine:
             #       request_to_blocks 共享同一列表，导致 allocate_more 重复追加。
             self.running_requests.append(
                 RunningRequest(
-                    req=req,
-                    kv_block_ids=list(block_ids),
+                    req=item.req,
+                    kv_block_ids=list(block_ids),   # 注意这里最好使用 “copy” 方法，否则会与 allocator 内部的 request_to_blocks 共享同一列表，导致 allocate_more 重复追加。
+                                                         # 即 kv_block_ids 和 request_to_blocks 内容相同，但是指向不同的地址
                     )
                 )
 
@@ -252,12 +273,16 @@ class ContinuousBatchingEngine:
             return
 
         # 模拟正在进行 prefill 花费的时间
-        max_prompt_len = max(item.req.prompt_len for item in unprefilled )
+        max_prompt_len = max(self._current_context_tokens(item) for item in unprefilled )
         await asyncio.sleep(max_prompt_len * self.prefill_time_per_token)
         
         # 标记所有请求为已 prefill
         for item in unprefilled:
             item.prefilled = True
+            item.state = RequestState.RUNNING
+
+            if item.preemption_count > 0:
+                item.recompute_tokens += self._current_context_tokens(item)
 
     async def _decode_one_step(self) -> None:
         """Decode one token for all running requests (one step).
@@ -268,21 +293,39 @@ class ContinuousBatchingEngine:
         # 模拟正在进行 decode 花费的时间
         await asyncio.sleep(self.decode_step_time)
 
-        suvivors : list[RunningRequest] = []
+        survivors : list[RunningRequest] = []
 
-        for item in self.running_requests:
-            try:
-                self._grow_blocks_if_needed(item)
-            except OutOfKVCacheError as error:
-                self.total_decode_kv_failures +=1
-                self._fail_running_request(item, error)
+        # 使用副本，因为抢占 victim 会修改 running_requests。
+        current_items = list(self.running_requests)
+
+        for item in current_items:
+            if item.state != RequestState.RUNNING:
                 continue
 
-            suvivors.append(item)
+            try:
+                self._grow_blocks_if_needed(item)
+            except OutOfKVCacheError :
+                can_continue = await self._handle_kv_growth_failture(item)
+
+                if not can_continue:
+                    continue
+
+            # victim 可能在前面已经 "被抢占"
+            if item.state == RequestState.PREEMPTED:
+                continue
+
             item.generated_tokens += 1
-    
-        self.running_requests = suvivors
-        self.total_decode_steps +=1
+            survivors.append(item)
+
+        # 只保留 还处于 Running 状态的请求
+        self.running_requests = [
+            item 
+            for item in survivors 
+            if item.state == RequestState.RUNNING
+        ]
+
+        self.total_decode_steps += 1
+
 
     def _required_tokens_next_decode(self,item : RunningRequest) -> int:
         return (
@@ -318,7 +361,10 @@ class ContinuousBatchingEngine:
         """
         request_id = item.req.request_id
 
+        item.state = RequestState.FAILED
+
         self._release_kv_block(request_id)
+        item.kv_block_ids.clear()
 
         future = self.pending.pop(request_id,None)
 
@@ -354,6 +400,8 @@ class ContinuousBatchingEngine:
             # 请求完成：
             # 1. 释放 KV block
             # 2. pending 结果置入已完成状态
+
+            item.state = RequestState.FINISHED
 
             if req.request_id in self.kv_allocator.request_to_blocks:
                 self.kv_allocator.free_by_request(req.request_id)
@@ -419,3 +467,90 @@ class ContinuousBatchingEngine:
             self.kv_allocator.free_by_request(req_id)
 
     
+    def _current_context_tokens(self,item : RunningRequest) -> int:
+        """Return the current number of context tokens for the given request."""
+        return item.req.prompt_len + item.generated_tokens
+
+    def _initial_kv_blocks(self,item : RunningRequest) -> int:
+        """Return the initial number of KV blocks required for the given request."""
+        context_tokens = self._current_context_tokens(item)
+        return self.kv_allocator.num_blocks_for_tokens(context_tokens)
+
+    def _select_preempttion_request(self,exclude_request_id : Optional[str] = None) -> Optional[RunningRequest]:
+        """Select a request to be preempted."""
+        candidates = [
+            item
+            for item in self.running_requests
+            if item.req.request_id != exclude_request_id
+        ]
+
+        if not candidates:
+            return None
+
+        return max(
+            candidates,
+            key=lambda item: len(item.kv_block_ids),
+        )
+
+    async def _preempt_request(
+        self,
+        victim : RunningRequest
+    ) -> None:
+        """Preempt the given request."""
+        request_id = victim.req.request_id
+
+        self._release_kv_block(request_id)
+
+        victim.state= RequestState.PREEMPTED
+        victim.preemption_count += 1
+        victim.prefilled = False
+        victim.kv_block_ids.clear()
+
+        self.running_requests = [
+            item
+            for item in self.running_requests
+            if item.req.request_id != request_id
+        ]
+
+        self.total_preemption_count += 1
+
+        await self.waiting_queue.put(victim)
+
+    async def _handle_kv_growth_failture(
+        self,
+        item : RunningRequest,
+    ) -> bool:
+        """Handle the failure of KV growth growth.
+        Preempt a request if the failure is due to insufficient KV blocks.
+        True
+            当前请求已经成功扩容，可以继续 decode。
+        False
+            当前请求被抢占或失败，本轮不能继续 decode。
+        """
+        victim = self._select_preempttion_request(item.req.request_id)
+
+        if victim is not None:
+            await self._preempt_request(victim)
+
+            # 抢占成功后重试当前请求的 block 扩容
+            try:
+                self._grow_blocks_if_needed(item)
+                return True
+            except OutOfKVCacheError:
+                pass
+
+        # 没有其他 victim，或者抢占后仍然不够。
+        if (
+            item.preemption_count < self.max_preemptions_per_request
+        ):
+            await self._preempt_request(item) # 选择进行 抢占请求自己！！！
+            return False 
+        
+        self._fail_running_request(
+            item,
+            RuntimeError(
+                "request exceeded maximum preemption count",
+            )
+        )
+        return False
+        
