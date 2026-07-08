@@ -3,6 +3,7 @@ from typing import Optional
 from app.request import GenerateRequest
 from app.kv_cache import BlockAllocator,OutOfKVCacheError
 from app.request_state import RequestState
+from app.prefix_cache import PrefixCache
 import time
 import asyncio
 
@@ -19,6 +20,12 @@ class RunningRequest:
     state : RequestState = RequestState.WAITING    # 当前的请求状态
     preemption_count : int = 0                     # 该请求被抢占过的次数
     recompute_tokens : int = 0                    # 恢复时需要重新计算的上下文 token 数。
+
+    # Prefix Cache
+    prefix_lookup_done : bool = False       # 防止 preemption 后重新 admission 时再次 lookup
+    prefix_cache_hit : bool = False         # 是否有缓存命中
+    matched_prefix_tokens : int = 0         # 可以直接跳过 prefill 的 prompt token 数
+    prefix_cache_block_ids : list[int] = field(default_factory=list)  # 命中的缓存 block ID 列表
 
 
 @dataclass
@@ -39,6 +46,8 @@ class ContinuousBatchingEngine:
         decode_step_time : float = 0.002,
         prefill_time_per_token : float = 0.001,
         max_preemptions_per_request : int = 3,
+        enable_prefix_cache : bool = True,
+        prefix_cache_max_blocks : int = 128,
     ) -> None:
         """Initialize the continuous batching engine.
 
@@ -61,6 +70,12 @@ class ContinuousBatchingEngine:
 
         self.kv_allocator = BlockAllocator(total_blocks=total_kv_blocks,block_size_tokens=block_size_tokens)
 
+        self.enable_prefix_cache = enable_prefix_cache
+        self.prefix_cache = PrefixCache(
+            block_size_tokens=block_size_tokens,
+            max_cached_blocks=prefix_cache_max_blocks,
+        )
+
         self.running : bool  = False
         self._worker_task : asyncio.Task | None = None
 
@@ -76,9 +91,22 @@ class ContinuousBatchingEngine:
         self.total_recomputations : int = 0    # 总的恢复计算次数
 
         self.max_preemptions_per_request: int = max_preemptions_per_request   # 一个请求 最多被抢占的次数 ： 防止一个请求被抢占次数过多，始终无法通过
+
+        # Prefix Cache 统计
+        self.total_prefix_cache_hits = 0
+        self.total_prefix_cache_misses = 0
+        self.total_prefix_matched_tokens = 0
+        self.total_saved_prefill_tokens = 0
+        self.total_actual_prefill_tokens = 0
+        self.total_prefix_cache_insert_failures = 0
     
     def stats(self) -> dict:
         """Return a snapshot of current engine statistics."""
+        prefix_requests = self.total_prefix_cache_hits + self.total_prefix_cache_misses
+        prefix_hit_rate = 0.0
+        if prefix_requests > 0:
+            prefix_hit_rate = self.total_prefix_cache_hits / prefix_requests
+
         return {
             "waiting_queue_size" : self.waiting_queue.qsize(),
             "running_requests" : len(self.running_requests),
@@ -94,6 +122,15 @@ class ContinuousBatchingEngine:
             "total_kv_blocks_grown" : self.total_kv_blocks_grown,
             "total_decode_kv_failures" : self.total_decode_kv_failures,
             "total_preemption_count" : self.total_preemption_count,
+            # Prefix Cache
+            "prefix_cache_hits": self.total_prefix_cache_hits,
+            "prefix_cache_misses": self.total_prefix_cache_misses,
+            "prefix_hit_rate": prefix_hit_rate,
+            "prefix_matched_tokens": self.total_prefix_matched_tokens,
+            "saved_prefill_tokens": self.total_saved_prefill_tokens,
+            "actual_prefill_tokens": self.total_actual_prefill_tokens,
+            "prefix_cache_insert_failures": self.total_prefix_cache_insert_failures,
+            "prefix_cache": self.prefix_cache.stats(),
             "kv_cache" : self.kv_allocator.stats(),
         }
 
@@ -198,8 +235,12 @@ class ContinuousBatchingEngine:
             and not self.waiting_queue.empty()
         ):
             item = await self.waiting_queue.get()
+            req = item.req
             req_cost = GenerateRequest.request_cost(item.req)
             current_tokens = self.current_running_tokens()
+            
+            # Prefix cache lookup: 在 admission 时执行，防止 preemption 后重新 lookup
+            self._lookup_prefix_cache_if_needed(item)
             
             # 第一层：逻辑 token budget 限制
             if(
@@ -218,6 +259,7 @@ class ContinuousBatchingEngine:
             maximum_blocks = self._maximum_kv_blocks(item.req)
 
             if maximum_blocks > self.kv_allocator.total_blocks:
+                self._release_prefix_cache_reference(item.req.request_id)
                 self._reject_request(
                     item.req,
                     RuntimeError(
@@ -250,8 +292,12 @@ class ContinuousBatchingEngine:
             self.running_requests.append(
                 RunningRequest(
                     req=item.req,
-                    kv_block_ids=list(block_ids),   # 注意这里最好使用 “copy” 方法，否则会与 allocator 内部的 request_to_blocks 共享同一列表，导致 allocate_more 重复追加。
+                    kv_block_ids=list(block_ids),   # 注意这里最好使用 "copy" 方法，否则会与 allocator 内部的 request_to_blocks 共享同一列表，导致 allocate_more 重复追加。
                                                          # 即 kv_block_ids 和 request_to_blocks 内容相同，但是指向不同的地址
+                    prefix_lookup_done=item.prefix_lookup_done,
+                    prefix_cache_hit=item.prefix_cache_hit,
+                    matched_prefix_tokens=item.matched_prefix_tokens,
+                    prefix_cache_block_ids=list(item.prefix_cache_block_ids),
                     )
                 )
 
@@ -266,23 +312,42 @@ class ContinuousBatchingEngine:
         """Prefill all requests that have not yet completed their prefill phase.
 
         Simulates the prefill time based on the longest prompt length.
+        Prefix cache hits reduce the number of tokens that need prefill.
         """
         unprefilled = [item for item in self.running_requests if not item.prefilled]
 
         if not unprefilled:
             return
 
-        # 模拟正在进行 prefill 花费的时间
-        max_prompt_len = max(self._current_context_tokens(item) for item in unprefilled )
-        await asyncio.sleep(max_prompt_len * self.prefill_time_per_token)
+        # 计算每个请求实际需要 prefill 的 token 数（考虑 prefix cache 命中）
+        prefill_tokens_by_request: dict[str, int] = {
+            item.req.request_id: self._prefill_tokens_needed(item)
+            for item in unprefilled
+        }
+        max_prefill_tokens = max(
+            prefill_tokens_by_request.values(),
+            default=0,
+        )
+        if max_prefill_tokens > 0:
+            await asyncio.sleep(
+                max_prefill_tokens * self.prefill_time_per_token
+            )
         
         # 标记所有请求为已 prefill
         for item in unprefilled:
+            actual_prefill_tokens = prefill_tokens_by_request[item.req.request_id]
+            reusable_tokens = min(
+                item.matched_prefix_tokens,
+                item.req.prompt_len,
+            )
+            self.total_actual_prefill_tokens += actual_prefill_tokens
+            self.total_saved_prefill_tokens += reusable_tokens
+            if item.preemption_count > 0:
+                item.recompute_tokens += actual_prefill_tokens
+                self.total_recomputations += 1
+                self.total_recompute_tokens += actual_prefill_tokens
             item.prefilled = True
             item.state = RequestState.RUNNING
-
-            if item.preemption_count > 0:
-                item.recompute_tokens += self._current_context_tokens(item)
 
     async def _decode_one_step(self) -> None:
         """Decode one token for all running requests (one step).
@@ -364,6 +429,7 @@ class ContinuousBatchingEngine:
         item.state = RequestState.FAILED
 
         self._release_kv_block(request_id)
+        self._release_prefix_cache_reference(request_id)
         item.kv_block_ids.clear()
 
         future = self.pending.pop(request_id,None)
@@ -398,13 +464,19 @@ class ContinuousBatchingEngine:
                 continue
 
             # 请求完成：
-            # 1. 释放 KV block
-            # 2. pending 结果置入已完成状态
+            # 1. 将当前 prompt 的完整 blocks 写入 prefix cache
+            # 2. 释放 KV block
+            # 3. 释放当前请求对 Prefix Cache 的引用
+            # 4. pending 结果置入已完成状态
 
             item.state = RequestState.FINISHED
 
+            # 先 insert 再 release：insert 增加 ref_count，release 减为 0，
+            # 最终 block 留在 cache 但没有活跃引用。
+            self._commit_prompt_to_prefix_cache(item)
             if req.request_id in self.kv_allocator.request_to_blocks:
                 self.kv_allocator.free_by_request(req.request_id)
+            self._release_prefix_cache_reference(item.req.request_id)
 
             future = self.pending.pop(req.request_id,None)
 
@@ -450,10 +522,11 @@ class ContinuousBatchingEngine:
         """Fail all pending requests with the given error.
 
         All pending futures are set to the exception state, and all
-        associated KV blocks are released.
+        associated KV blocks and prefix cache references are released.
         """
         for request_id, future in list(self.pending.items()):
             self._release_kv_block(request_id)
+            self._release_prefix_cache_reference(request_id)
 
             if not future.done():
                 future.set_exception(error)
@@ -475,6 +548,74 @@ class ContinuousBatchingEngine:
         """Return the initial number of KV blocks required for the given request."""
         context_tokens = self._current_context_tokens(item)
         return self.kv_allocator.num_blocks_for_tokens(context_tokens)
+
+    def _lookup_prefix_cache_if_needed(
+        self,
+        item: RunningRequest,
+    ) -> None:
+        """Perform a prefix cache lookup if enabled and not already done."""
+        if not self.enable_prefix_cache:
+            return
+        if item.prefix_lookup_done:
+            return
+        match = self.prefix_cache.lookup(
+            request_id=item.req.request_id,
+            prompt=item.req.prompt,
+        )
+        item.prefix_lookup_done = True
+        item.matched_prefix_tokens = match.matched_tokens
+        item.prefix_cache_block_ids = list(match.block_ids)
+        item.prefix_cache_hit = match.matched_tokens > 0
+        if item.prefix_cache_hit:
+            self.total_prefix_cache_hits += 1
+            self.total_prefix_matched_tokens += match.matched_tokens
+        else:
+            self.total_prefix_cache_misses += 1
+
+    def _prefill_tokens_needed(
+        self,
+        item: RunningRequest,
+    ) -> int:
+        """Calculate the number of tokens that actually need prefill.
+
+        This accounts for prefix cache hits that reduce the prefill workload.
+        """
+        current_context_tokens = (
+            item.req.prompt_len
+            + item.generated_tokens
+        )
+        reusable_prefix_tokens = min(
+            item.matched_prefix_tokens,
+            item.req.prompt_len,
+        )
+        return max(
+            0,
+            current_context_tokens - reusable_prefix_tokens,
+        )
+
+    def _commit_prompt_to_prefix_cache(
+        self,
+        item: RunningRequest,
+    ) -> None:
+        """Insert the prompt into the prefix cache after request completion."""
+        if not self.enable_prefix_cache:
+            return
+        try:
+            self.prefix_cache.insert(
+                request_id=item.req.request_id,
+                prompt=item.req.prompt,
+            )
+        except RuntimeError:
+            self.total_prefix_cache_insert_failures += 1
+
+    def _release_prefix_cache_reference(
+        self,
+        request_id: str,
+    ) -> None:
+        """Release all prefix cache references held by a request."""
+        if not self.enable_prefix_cache:
+            return
+        self.prefix_cache.release_request(request_id)
 
     def _select_preempttion_request(self,exclude_request_id : Optional[str] = None) -> Optional[RunningRequest]:
         """Select a request to be preempted."""
